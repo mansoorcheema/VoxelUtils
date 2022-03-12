@@ -4,7 +4,7 @@
 #include <algorithm>
 #include <cstring>
 
-void depth2Grid(double* cam_info, double* vox_info, double* depth_data, double* vox_binary_GPU,
+void depth2Grid(double* cam_info, double* vox_info, double* depth_data, double* vox_binary,
                 double* depth2voxel_idx) {
     // Get camera information
     int frame_width = cam_info[0];
@@ -23,7 +23,8 @@ void depth2Grid(double* cam_info, double* vox_info, double* depth_data, double* 
     for (int i = 0; i < 3; ++i) vox_origin[i] = vox_info[i + 5];
 
     // Get point in world coordinate
-    for (size_t pixel_x = 0; pixel_x < frame_width; frame_width++) {
+    #pragma omp parallel for
+    for (size_t pixel_x = 0; pixel_x < frame_width; pixel_x++) {
         for (size_t pixel_y = 0; pixel_y < frame_height; pixel_y++) {
             double point_depth = depth_data[pixel_y * frame_width + pixel_x];
 
@@ -50,10 +51,10 @@ void depth2Grid(double* cam_info, double* vox_info, double* depth_data, double* 
             int x = (int)floor((point_base[1] - vox_origin[1]) / vox_unit);
             int y = (int)floor((point_base[2] - vox_origin[2]) / vox_unit);
 
-            // mark vox_binary_GPU
+            // mark vox_binary
             if (x >= 0 && x < vox_size[0] && y >= 0 && y < vox_size[1] && z >= 0 && z < vox_size[2]) {
                 int vox_idx = z * vox_size[0] * vox_size[1] + y * vox_size[0] + x;
-                vox_binary_GPU[vox_idx] = double(1.0);
+                vox_binary[vox_idx] = double(1.0);
                 depth2voxel_idx[pixel_y * frame_width + pixel_x] = vox_idx;
             }
         }
@@ -83,7 +84,7 @@ void tsdfTransform(double* vox_info, double* vox_tsdf) {
     }
 }
 
-void SquaredDistanceTransform(double* cam_info, double* vox_info, double* depth_data, double* vox_binary_GPU,
+void SquaredDistanceTransform(double* cam_info, double* vox_info, double* depth_data, double* vox_binary,
                               double* vox_tsdf) {
     // Get voxel volume parameters
     double vox_unit = vox_info[0];
@@ -121,16 +122,16 @@ void SquaredDistanceTransform(double* cam_info, double* vox_info, double* depth_
 
     // Total voxels in a fixed 3d volume of voxel_size
     size_t num_voxels = vox_size[0] * vox_size[1] * vox_size[2];
-
+    #pragma omp parallel for
     for (size_t vox_idx = 0; vox_idx < num_voxels; ++vox_idx) {
         int z = double((vox_idx / (vox_size[0] * vox_size[1])) % vox_size[2]);
         int y = double((vox_idx / vox_size[0]) % vox_size[1]);
         int x = double(vox_idx % vox_size[0]);
         int search_region = (int)round(vox_margin / vox_unit);
 
-        if (vox_binary_GPU[vox_idx] > 0) {
+        if (vox_binary[vox_idx] > 0) {
             vox_tsdf[vox_idx] = 0;
-            return;
+            continue;
         }
 
         // Get point in world coordinates (XYZ) from grid coordinates (YZX)
@@ -151,24 +152,24 @@ void SquaredDistanceTransform(double* cam_info, double* vox_info, double* depth_
         point_cam[2] = cam_pose[0 * 4 + 2] * point_base[0] + cam_pose[1 * 4 + 2] * point_base[1] +
                        cam_pose[2 * 4 + 2] * point_base[2];
         if (point_cam[2] <= 0) {
-            return;
+            continue;
         }
 
         // Project point to 2D
         int pixel_x = roundf(cam_K[0] * (point_cam[0] / point_cam[2]) + cam_K[2]);
         int pixel_y = roundf(cam_K[4] * (point_cam[1] / point_cam[2]) + cam_K[5]);
         if (pixel_x < 0 || pixel_x >= frame_width || pixel_y < 0 || pixel_y >= frame_height) {  // outside FOV
-            return;
+            continue;
         }
 
         // Get depth
         double point_depth = depth_data[pixel_y * frame_width + pixel_x];
         if (point_depth < double(0.5f) || point_depth > double(8.0f)) {
-            return;
+            continue;
         }
         if (roundf(point_depth) == 0) {  // mising depth
             vox_tsdf[vox_idx] = double(-1.0);
-            return;
+            continue;
         }
 
         // Get depth difference
@@ -185,7 +186,7 @@ void SquaredDistanceTransform(double* cam_info, double* vox_info, double* depth_
                 for (int iiz = std::max(0, z - search_region); iiz < std::min((int)vox_size[2], z + search_region + 1);
                      iiz++) {
                     int iidx = iiz * vox_size[0] * vox_size[1] + iiy * vox_size[0] + iix;
-                    if (vox_binary_GPU[iidx] > 0) {
+                    if (vox_binary[iidx] > 0) {
                         double xd = std::abs(x - iix);
                         double yd = std::abs(y - iiy);
                         double zd = std::abs(z - iiz);
@@ -200,32 +201,32 @@ void SquaredDistanceTransform(double* cam_info, double* vox_info, double* depth_
     }
 }
 
-void ComputeTSDF(double* cam_info_CPU, double* vox_info_CPU, double* depth_data_CPU, double* vox_tsdf_CPU,
-                 double* depth_mapping_idxs_CPU, double* occupancy) {
-    int frame_width = cam_info_CPU[0];
-    int frame_height = cam_info_CPU[1];
+void ComputeTSDF(double* cam_info, double* vox_info, double* depth_data, double* vox_tsdf,
+                 double* depth_mapping_idxs, double* occupancy) {
+    int frame_width = cam_info[0];
+    int frame_height = cam_info[1];
     int vox_size[3];
 
     for (int i = 0; i < 3; ++i) {
-        vox_size[i] = vox_info_CPU[i + 2];
+        vox_size[i] = vox_info[i + 2];
     }
     int num_crop_voxels = vox_size[0] * vox_size[1] * vox_size[2];
 
     // allocate voxel occupancy
-    double* vox_binary_CPU = (double*)malloc((int)(num_crop_voxels * sizeof(double)));
-    std::memset(vox_binary_CPU, 0, num_crop_voxels * sizeof(double));
+    double* vox_binary = (double*)malloc((int)(num_crop_voxels * sizeof(double)));
+    std::memset(vox_binary, 0, num_crop_voxels * sizeof(double));
 
     // from depth map to binaray voxel representation
-    depth2Grid(cam_info_CPU, vox_info_CPU, depth_data_CPU, vox_binary_CPU, depth_mapping_idxs_CPU);
-    SquaredDistanceTransform(cam_info_CPU, vox_info_CPU, depth_data_CPU, vox_binary_CPU, vox_tsdf_CPU);
-    tsdfTransform(vox_info_CPU, vox_tsdf_CPU);  // invert TSDF
+    depth2Grid(cam_info, vox_info, depth_data, vox_binary, depth_mapping_idxs);
+    SquaredDistanceTransform(cam_info, vox_info, depth_data, vox_binary, vox_tsdf);
+    tsdfTransform(vox_info, vox_tsdf);  // invert TSDF
 
     // copy computed TSDF back
-    memcpy(occupancy, vox_binary_CPU, num_crop_voxels * sizeof(double));
-    free(vox_binary_CPU);
+    memcpy(occupancy, vox_binary, num_crop_voxels * sizeof(double));
+    free(vox_binary);
 }
 
-void calculate_occupancy_prob(double* cam_info, double* vox_info, double* depth_data, double* vox_log_GPU) {
+void calculate_occupancy_prob(double* cam_info, double* vox_info, double* depth_data, double* vox_log) {
     // Get camera information
     int frame_width = cam_info[0];
     int frame_height = cam_info[1];
@@ -243,10 +244,8 @@ void calculate_occupancy_prob(double* cam_info, double* vox_info, double* depth_
     for (int i = 0; i < 3; ++i) vox_origin[i] = vox_info[i + 5];
 
     // Get point in world coordinate
-    //   int pixel_x = blockIdx.x;
-    //   int pixel_y = threadIdx.x;
-
-    for (size_t pixel_x = 0; pixel_x < frame_width; frame_width++) {
+    #pragma omp parallel for
+    for (size_t pixel_x = 0; pixel_x < frame_width; pixel_x++) {
         for (size_t pixel_y = 0; pixel_y < frame_height; pixel_y++) {
             double point_depth = depth_data[pixel_y * frame_width + pixel_x];
 
@@ -278,34 +277,34 @@ void calculate_occupancy_prob(double* cam_info, double* vox_info, double* depth_
 
             if (x >= 0 && x < vox_size[0] && y >= 0 && y < vox_size[1] && z >= 0 && z < vox_size[2]) {
                 int vox_idx = z * vox_size[0] * vox_size[1] + y * vox_size[0] + x;
-                vox_log_GPU[vox_idx] = std::min(vox_log_GPU[vox_idx] + std::log(prob_occ / (1 - prob_occ)),
+                vox_log[vox_idx] = std::min(vox_log[vox_idx] + std::log(prob_occ / (1 - prob_occ)),
                                                 std::log(max_prob / (1 - max_prob)));
             }
         }
     }
 }
 
-void calculateOccupancyProb(double* cam_info_CPU, double* vox_info_CPU, double* depth_data_CPU,
+void calculateOccupancyProb(double* cam_info, double* vox_info, double* depth_data,
                             double* log_odds_occupancy) {
-    int frame_width = cam_info_CPU[0];
-    int frame_height = cam_info_CPU[1];
+    int frame_width = cam_info[0];
+    int frame_height = cam_info[1];
     int vox_size[3];
 
     for (int i = 0; i < 3; ++i) {
-        vox_size[i] = vox_info_CPU[i + 2];
+        vox_size[i] = vox_info[i + 2];
     }
     int num_crop_voxels = vox_size[0] * vox_size[1] * vox_size[2];
 
     // allocate voxel occupancy
-    double* vox_prob_CPU = (double*)malloc((int)(num_crop_voxels * sizeof(double)));
-    std::memset(vox_prob_CPU, 0, num_crop_voxels * sizeof(double));
+    double* vox_prob = (double*)malloc((int)(num_crop_voxels * sizeof(double)));
+    std::memset(vox_prob, 0, num_crop_voxels * sizeof(double));
 
     // from depth map to binary voxel representation
-    calculate_occupancy_prob(cam_info_CPU, vox_info_CPU, depth_data_CPU, vox_prob_CPU);
+    calculate_occupancy_prob(cam_info, vox_info, depth_data, vox_prob);
 
     // copy computed log odds back to CPU
-    memcpy(log_odds_occupancy, vox_prob_CPU, num_crop_voxels * sizeof(double));
+    memcpy(log_odds_occupancy, vox_prob, num_crop_voxels * sizeof(double));
 
     // deallocation
-    free(vox_prob_CPU);
+    free(vox_prob);
 }

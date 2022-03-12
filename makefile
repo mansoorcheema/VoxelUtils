@@ -7,7 +7,7 @@ all: build
 build:
 ifeq (, $(shell which nvcc))
 	@echo using CPU
-	gcc -c voxel_util.cpp -o voxel_util.o 
+	gcc -c voxel_util.cpp -o voxel_util.o -fopenmp
 	rm -f libvoxelutil.a
 	ar crs libvoxelutil.a voxel_util.o 
 	ranlib libvoxelutil.a
@@ -26,3 +26,4 @@ endif
 clean:
 	rm -f libvoxelutil.a *.o main temp.py
 	rm -rf build
+
